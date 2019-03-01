@@ -772,25 +772,20 @@ class VAE(LAED):
         self.x_embedding = nn.Embedding(self.vocab_size, config.embed_size)
 
         # latent action learned
-        self.x_encoder = EncoderRNN(config.embed_size,
-                                    config.dec_cell_size,
+        self.x_encoder = EncoderRNN(config.embed_size, config.dec_cell_size,
                                     dropout_p=config.dropout,
                                     rnn_cell=config.rnn_cell,
                                     variable_lengths=False)
 
-        self.q_y = nn.Linear(config.dec_cell_size, config.y_size)
-        self.x_init_connector = nn_lib.LinearConnector(config.y_size,
+        self.q_y = nn.Linear(config.dec_cell_size, config.y_size * config.k)
+        self.x_init_connector = nn_lib.LinearConnector(config.y_size * config.k,
                                                        config.dec_cell_size,
                                                        config.rnn_cell == 'lstm')
         # decoder
-        self.x_decoder = DecoderRNN(self.vocab_size,
-                                    config.max_dec_len,
-                                    config.embed_size,
-                                    config.dec_cell_size,
-                                    self.go_id,
-                                    self.eos_id,
-                                    n_layers=1,
-                                    rnn_cell=config.rnn_cell,
+        self.x_decoder = DecoderRNN(self.vocab_size, config.max_dec_len,
+                                    config.embed_size, config.dec_cell_size,
+                                    self.go_id, self.eos_id,
+                                    n_layers=1, rnn_cell=config.rnn_cell,
                                     input_dropout_p=config.dropout,
                                     dropout_p=config.dropout,
                                     use_attention=False,
@@ -798,12 +793,10 @@ class VAE(LAED):
                                     embedding=self.x_embedding)
 
         # Encoder-Decoder STARTS here
-        self.embedding = nn.Embedding(self.vocab_size,
-                                      config.embed_size,
+        self.embedding = nn.Embedding(self.vocab_size, config.embed_size,
                                       padding_idx=self.rev_vocab[PAD])
 
-        self.utt_encoder = RnnUttEncoder(config.utt_cell_size,
-                                         config.dropout,
+        self.utt_encoder = RnnUttEncoder(config.utt_cell_size, config.dropout,
                                          use_attn=config.utt_type == 'attn_rnn',
                                          vocab_size=self.vocab_size,
                                          embedding=self.embedding)
@@ -816,21 +809,18 @@ class VAE(LAED):
                                       config.rnn_cell,
                                       variable_lengths=self.config.fix_batch)
         # FNN to get Y
-        self.p_y = nn.Linear(config.ctx_cell_size, config.y_size)
+        self.p_fc1 = nn.Linear(config.ctx_cell_size, config.ctx_cell_size)
+        self.p_y = nn.Linear(config.ctx_cell_size, config.y_size * config.k)
 
         # connector
-        self.c_init_connector = nn_lib.LinearConnector(config.y_size,
+        self.c_init_connector = nn_lib.LinearConnector(config.y_size * config.k,
                                                        config.dec_cell_size,
                                                        config.rnn_cell == 'lstm')
         # decoder
-        self.decoder = DecoderRNN(self.vocab_size,
-                                  config.max_dec_len,
-                                  config.embed_size,
-                                  config.dec_cell_size,
-                                  self.go_id,
-                                  self.eos_id,
-                                  n_layers=1,
-                                  rnn_cell=config.rnn_cell,
+        self.decoder = DecoderRNN(self.vocab_size, config.max_dec_len,
+                                  config.embed_size, config.dec_cell_size,
+                                  self.go_id, self.eos_id,
+                                  n_layers=1, rnn_cell=config.rnn_cell,
                                   input_dropout_p=config.dropout,
                                   dropout_p=config.dropout,
                                   use_attention=config.use_attn,
@@ -839,9 +829,16 @@ class VAE(LAED):
                                   use_gpu=config.use_gpu,
                                   embedding=self.embedding)
 
+        # force G(z,c) has z
+        if config.use_attribute:
+            self.attribute_loss = criterions.NLLEntropy(-100, config)
+
+        self.cat_connector = nn_lib.GumbelConnector()
+        self.greedy_cat_connector = nn_lib.GreedyConnector()
         self.nll_loss = criterions.NLLEntropy(self.rev_vocab[PAD], self.config)
         self.kl_loss = criterions.NormKLLoss()
-        self.log_uniform_y = Variable(torch.log(torch.ones(1) / config.y_size))
+        self.log_uniform_y = Variable(torch.log(torch.ones(1) / config.k))
+        self.entropy_loss = criterions.Entropy()
 
         if self.use_gpu:
             self.log_uniform_y = self.log_uniform_y.cuda()
@@ -854,6 +851,9 @@ class VAE(LAED):
             enc_loss += loss.pi_nll
         else:
             enc_loss += loss.pi_kl
+
+        if self.config.use_attribute:
+            enc_loss += 0.1*loss.attribute_nll
 
         if batch_cnt is not None and batch_cnt > self.config.freeze_step:
             total_loss = enc_loss
@@ -878,11 +878,8 @@ class VAE(LAED):
     def pxz_forward(self, batch_size, results, out_utts, mode, gen_type):
         # map sample to initial state of decoder
         dec_init_state = self.x_init_connector(results.sample_y)
-        dec_outs, dec_last, dec_ctx = self.x_decoder(batch_size,
-                                                     out_utts[:, 0:-1],
-                                                     dec_init_state,
-                                                     mode=mode,
-                                                     gen_type=gen_type,
+        dec_outs, dec_last, dec_ctx = self.x_decoder(batch_size, out_utts[:, 0:-1], dec_init_state,
+                                                     mode=mode, gen_type=gen_type,
                                                      beam_size=self.config.beam_size)
         results['dec_outs'] = dec_outs
         results['dec_ctx'] = dec_ctx
@@ -897,11 +894,8 @@ class VAE(LAED):
         out_utts = self.np2var(data_feed['outputs'], LONG)
 
         # First do VAE here
-        vae_resp = self.pxz_forward(batch_size,
-                                    self.qzx_forward(out_utts[:, 1:]),
-                                    out_utts,
-                                    mode,
-                                    gen_type)
+        vae_resp = self.pxz_forward(batch_size, self.qzx_forward(out_utts[:, 1:]),
+                                    out_utts, mode, gen_type)
 
         # context encoder
         c_inputs = self.utt_encoder(ctx_utts)
@@ -926,11 +920,8 @@ class VAE(LAED):
                     temp_ids = []
                     # sample the prior network N times
                     for i in range(sample_n):
-                        temp_y, temp_id = self.cat_connector(py_logits,
-                                                             1.0,
-                                                             self.use_gpu,
-                                                             hard=True,
-                                                             return_max_id=True)
+                        temp_y, temp_id = self.cat_connector(py_logits, 1.0, self.use_gpu,
+                                                             hard=True, return_max_id=True)
                         temp_ids.append(temp_id.view(-1, self.config.y_size))
                         temp.append(temp_y.view(-1, self.config.k * self.config.y_size))
 
@@ -949,8 +940,11 @@ class VAE(LAED):
                 else:
                     raise ValueError
             else:
-                sample_y, y_id = self.cat_connector(py_logits, 1.0, self.use_gpu,
-                                                    hard=True, return_max_id=True)
+                sample_y, y_id = self.greedy_cat_connector(py_logits,
+                                                           1.0,
+                                                           self.use_gpu,
+                                                            hard=True,
+                                                           return_max_id=True)
 
         # pack attention context
         if self.config.use_attn:
@@ -987,18 +981,34 @@ class VAE(LAED):
 
             # Encoder-decoder Losses
             enc_dec_nll = self.nll_loss(dec_outs, labels)
-            pi_kl = self.kl_loss(log_qy.detach(), log_py, batch_size, unit_average=True)
+            pi_kl = self.cat_kl_loss(log_qy.detach(), log_py, batch_size, unit_average=True)
             pi_nll = F.cross_entropy(py_logits.view(-1, self.config.k), y_id.view(-1))
             _, max_pi = torch.max(py_logits.view(-1, self.config.k), dim=1)
             pi_err = torch.mean((max_pi != y_id.view(-1)).float())
 
-            results = Pack(nll=enc_dec_nll,
-                           pi_kl=pi_kl,
-                           vae_nll=vae_nll,
-                           reg_kl=reg_kl,
-                           mi=mi,
-                           pi_nll=pi_nll,
-                           pi_err=pi_err)
+            if self.config.use_attribute:
+                pad_embeded = self.x_embedding.weight[self.rev_vocab[PAD]].view(1, 1, self.config.embed_size)
+                pad_embeded = pad_embeded.repeat(batch_size, dec_outs.size(1), 1)
+                mask = torch.sign(labels).float().unsqueeze(2)
+                dec_out_p = torch.exp(dec_outs.view(-1, self.vocab_size))
+                dec_out_embedded = torch.matmul(dec_out_p, self.x_embedding.weight)
+                dec_out_embedded = dec_out_embedded.view(-1, dec_outs.size(1), self.config.embed_size)
+                valid_out_embedded = mask * dec_out_embedded + (1.0-mask) * pad_embeded
+
+                x_outs, x_last = self.x_encoder(valid_out_embedded)
+                x_last = x_last.transpose(0, 1).contiguous().view(-1, self.config.dec_cell_size)
+                qy_logits = self.q_y(x_last).view(-1, self.config.k)
+                attribute_nll = F.cross_entropy(qy_logits, y_id.view(-1).detach())
+
+                _, max_qy = torch.max(qy_logits.view(-1, self.config.k), dim=1)
+                adv_err = torch.mean((max_qy != y_id.view(-1)).float())
+            else:
+                attribute_nll = None
+                adv_err = None
+
+            results = Pack(nll=enc_dec_nll, pi_kl=pi_kl, attribute_nll=attribute_nll,
+                           vae_nll=vae_nll, reg_kl=reg_kl, mi=mi, pi_nll=pi_nll,
+                           pi_err=pi_err, adv_err=adv_err)
 
             if return_latent:
                 results['log_py'] = log_py

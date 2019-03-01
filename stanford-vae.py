@@ -39,6 +39,7 @@ data_arg.add_argument('--log_dir', type=str, default='logs')
 net_arg = add_argument_group('Network')
 net_arg.add_argument('--y_size', type=int, default=1)
 net_arg.add_argument('--k', type=int, default=128)
+net_arg.add_argument('--use_attribute', type=str2bool, default=False)
 
 net_arg.add_argument('--rnn_cell', type=str, default='gru')
 net_arg.add_argument('--embed_size', type=int, default=200)
@@ -97,9 +98,7 @@ def main(config):
     prepare_dirs_loggers(config, os.path.basename(__file__))
 
     dial_corpus = corpus_client.get_corpus()
-    train_dial, valid_dial, test_dial = dial_corpus['train'],\
-                                        dial_corpus['valid'],\
-                                        dial_corpus['test']
+    train_dial, valid_dial, test_dial = dial_corpus['train'], dial_corpus['valid'], dial_corpus['test']
 
     evaluator = evaluators.BleuEvaluator(os.path.basename(__file__))
 
@@ -126,8 +125,13 @@ def main(config):
 
     if config.forward_only is False:
         try:
-            engine.train(model, train_feed, valid_feed,
-                         test_feed, config, evaluator, gen=dialog_utils.generate_with_adv)
+            engine.train(model,
+                         train_feed,
+                         valid_feed,
+                         test_feed,
+                         config,
+                         evaluator,
+                         gen=dialog_utils.generate_with_adv)
         except KeyboardInterrupt:
             print("Training stopped by keyboard.")
 
@@ -153,13 +157,11 @@ def main(config):
 
     with open(os.path.join(test_file), "wb") as f:
         print("Saving test to {}".format(test_file))
-        dialog_utils.gen_with_cond(model, test_feed, config, num_batch=None,
-                                   dest_f=f)
+        dialog_utils.gen_with_cond(model, test_feed, config, num_batch=None, dest_f=f)
 
     with open(os.path.join(test_file+'.txt'), "wb") as f:
         print("Saving test to {}".format(test_file))
-        dialog_utils.generate(model, test_feed, config, evaluator, num_batch=None,
-                                   dest_f=f)
+        dialog_utils.generate(model, test_feed, config, evaluator, num_batch=None, dest_f=f)
 
 
 if __name__ == "__main__":
