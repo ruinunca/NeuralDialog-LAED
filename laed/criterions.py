@@ -86,7 +86,7 @@ class NormKLLoss(_Loss):
             kl_loss = -0.5 * torch.mean(loss, dim=1)
         else:
             kl_loss = -0.5 * torch.sum(loss, dim=1)
-        avg_kl_loss = torch.mean(kl_loss)
+        avg_kl_loss = torch.mean(kl_loss, dim=-1)
         return avg_kl_loss
 
 
