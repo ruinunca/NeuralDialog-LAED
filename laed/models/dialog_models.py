@@ -181,9 +181,7 @@ class LAED(BaseModel):
         return dec_ctx
 
     def model_sel_loss(self, loss, batch_cnt):
-        if self.kl_w == 0.0:
-            return self.valid_loss(loss, batch_cnt)
-        return loss.pi_err+loss.adv_err
+        return self.valid_loss(loss, batch_cnt)
 
 
 class AeED(LAED):

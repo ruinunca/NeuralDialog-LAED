@@ -404,7 +404,7 @@ def generate_vae(model, data_feed, config, evaluator, num_batch=1, dest_f=None):
                                                          else num_batch))
 
     if num_batch is not None:
-        gen_with_cond(model, data_feed, config, num_batch)
+        gen_with_vae(model, data_feed, config, num_batch)
 
     logger.info("Generation Done")
 
