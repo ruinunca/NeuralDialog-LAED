@@ -777,7 +777,7 @@ class VAE(LAED):
                                     rnn_cell=config.rnn_cell,
                                     variable_lengths=False)
 
-        self.q_y = nn.Linear(config.dec_cell_size, config.y_size * config.k)
+        self.q_y = nn.Linear(config.dec_cell_size, config.y_size * config.k * 2)
         self.x_init_connector = nn_lib.LinearConnector(config.y_size * config.k,
                                                        config.dec_cell_size,
                                                        config.rnn_cell == 'lstm')
@@ -812,6 +812,9 @@ class VAE(LAED):
         self.p_fc1 = nn.Linear(config.ctx_cell_size, config.ctx_cell_size)
         self.p_y = nn.Linear(config.ctx_cell_size, config.y_size * config.k)
 
+        self.z_mu = self.np2var(np.zeros((self.config.batch_size, config.y_size * config.k)), FLOAT)
+        self.z_logvar = self.np2var(np.zeros((self.config.batch_size, config.y_size * config.k)), FLOAT)
+
         # connector
         self.c_init_connector = nn_lib.LinearConnector(config.y_size * config.k,
                                                        config.dec_cell_size,
@@ -835,6 +838,7 @@ class VAE(LAED):
 
         self.cat_connector = nn_lib.GumbelConnector()
         self.greedy_cat_connector = nn_lib.GreedyConnector()
+        self.gaussian_connector = nn_lib.GaussianConnector()
         self.nll_loss = criterions.NLLEntropy(self.rev_vocab[PAD], self.config)
         self.kl_loss = criterions.NormKLLoss()
         self.log_uniform_y = Variable(torch.log(torch.ones(1) / config.k))
@@ -847,10 +851,6 @@ class VAE(LAED):
     def valid_loss(self, loss, batch_cnt=None):
         vae_loss = loss.vae_nll + loss.reg_kl
         enc_loss = loss.nll
-        if self.config.greedy_q:
-            enc_loss += loss.pi_nll
-        else:
-            enc_loss += loss.pi_kl
 
         if self.config.use_attribute:
             enc_loss += 0.1*loss.attribute_nll
@@ -875,6 +875,18 @@ class VAE(LAED):
 
         return total_loss
 
+    def qzx_forward(self, out_utts):
+        # output encoder
+        output_embedding = self.x_embedding(out_utts)
+        x_outs, x_last = self.x_encoder(output_embedding)
+        x_last = x_last.transpose(0, 1).contiguous().view(-1, self.config.dec_cell_size)
+        qy_logits = self.q_y(x_last)
+
+        mu, logvar = torch.split(qy_logits, self.config.k, dim=-1)
+        sample_y = self.gaussian_connector(mu, logvar, use_gpu=self.config.use_gpu) 
+
+        return Pack(qy_logits=qy_logits, mu=mu, logvar=logvar, sample_y=sample_y)
+
     def pxz_forward(self, batch_size, results, out_utts, mode, gen_type):
         # map sample to initial state of decoder
         dec_init_state = self.x_init_connector(results.sample_y)
@@ -894,8 +906,12 @@ class VAE(LAED):
         out_utts = self.np2var(data_feed['outputs'], LONG)
 
         # First do VAE here
-        vae_resp = self.pxz_forward(batch_size, self.qzx_forward(out_utts[:, 1:]),
-                                    out_utts, mode, gen_type)
+        vae_resp = self.pxz_forward(batch_size,
+                                    self.qzx_forward(out_utts[:, 1:]),
+                                    out_utts,
+                                    mode,
+                                    gen_type)
+        qy_mu, qy_logvar = vae_resp.mu, vae_resp.logvar
 
         # context encoder
         c_inputs = self.utt_encoder(ctx_utts)
@@ -903,16 +919,12 @@ class VAE(LAED):
         c_last = c_last.squeeze(0)
 
         # prior network
-        py_logits = self.p_y(F.tanh(self.p_fc1(c_last))).view(-1, self.config.k)
-        log_py = F.log_softmax(py_logits, dim=py_logits.dim()-1)
+        # py_logits = self.p_y(F.tanh(self.p_fc1(c_last))).view(-1, self.config.k * 2)
+        # log_py = F.log_softmax(py_logits, dim=py_logits.dim()-1)
 
         if mode != GEN:
-            sample_y, y_id = vae_resp.sample_y.detach(), vae_resp.y_ids.detach()
-            y_id = y_id.view(-1, self.config.y_size)
-            qy_id = y_id
+            sample_y = vae_resp.sample_y.detach()
         else:
-            qy_id = vae_resp.y_ids.detach()
-            qy_id = qy_id.view(-1, self.config.y_size)
 
             if sample_n > 1:
                 if gen_type == 'greedy':
@@ -920,31 +932,23 @@ class VAE(LAED):
                     temp_ids = []
                     # sample the prior network N times
                     for i in range(sample_n):
-                        temp_y, temp_id = self.cat_connector(py_logits, 1.0, self.use_gpu,
-                                                             hard=True, return_max_id=True)
-                        temp_ids.append(temp_id.view(-1, self.config.y_size))
+                        temp_y = self.gaussian_connector(qy_mu, qy_logvar, self.use_gpu)
                         temp.append(temp_y.view(-1, self.config.k * self.config.y_size))
 
                     sample_y = torch.cat(temp, dim=0)
-                    y_id = torch.cat(temp_ids, dim=0)
                     batch_size *= sample_n
                     c_last = c_last.repeat(sample_n, 1)
 
                 elif gen_type == 'sample':
-                    sample_y, y_id = self.greedy_cat_connector(py_logits, self.use_gpu, return_max_id=True)
+                    sample_y = self.gaussian_connector(qy_mu, qy_logvar, self.use_gpu)
                     sample_y = sample_y.view(-1, self.config.k*self.config.y_size).repeat(sample_n, 1)
-                    y_id = y_id.view(-1, self.config.y_size).repeat(sample_n, 1)
                     c_last = c_last.repeat(sample_n, 1)
                     batch_size *= sample_n
 
                 else:
                     raise ValueError
             else:
-                sample_y, y_id = self.greedy_cat_connector(py_logits,
-                                                           1.0,
-                                                           self.use_gpu,
-                                                            hard=True,
-                                                           return_max_id=True)
+                sample_y = self.gaussian_connector(qy_mu, qy_logvar, self.use_gpu)
 
         # pack attention context
         if self.config.use_attn:
@@ -957,15 +961,17 @@ class VAE(LAED):
         dec_init_state = self.c_init_connector(sample_y) + c_last.unsqueeze(0)
 
         # decode
-        dec_outs, dec_last, dec_ctx = self.decoder(batch_size, out_utts[:, 0:-1], dec_init_state,
+        dec_outs, dec_last, dec_ctx = self.decoder(batch_size, out_utts[:, 0:-1],
+                                                   dec_init_state,
                                                    attn_context=attn_inputs,
-                                                   mode=mode, gen_type=gen_type,
+                                                   mode=mode,
+                                                   gen_type=gen_type,
                                                    beam_size=self.config.beam_size)
         # get decoder inputs
         labels = out_utts[:, 1:].contiguous()
-        dec_ctx[DecoderRNN.KEY_RECOG_LATENT] = qy_id
-        dec_ctx[DecoderRNN.KEY_LATENT] = y_id
-        dec_ctx[DecoderRNN.KEY_POLICY] = log_py
+        dec_ctx[DecoderRNN.KEY_RECOG_LATENT] = None 
+        dec_ctx[DecoderRNN.KEY_LATENT] = None 
+        dec_ctx[DecoderRNN.KEY_POLICY] = None 
 
         # compute loss or return results
         if mode == GEN:
@@ -976,15 +982,10 @@ class VAE(LAED):
             vae_nll = self.nll_loss(vae_resp.dec_outs, labels)
             avg_log_qy = torch.exp(log_qy.view(-1, self.config.y_size, self.config.k))
             avg_log_qy = torch.log(torch.mean(avg_log_qy, dim=0) + 1e-15)
-            reg_kl = self.cat_kl_loss(avg_log_qy, self.log_uniform_y, batch_size, unit_average=True)
-            mi = self.entropy_loss(avg_log_qy, unit_average=True) - self.entropy_loss(log_qy, unit_average=True)
+            reg_kl = self.kl_loss(qy_mu, qy_logvar, self.z_mu, self.z_logvar)
 
             # Encoder-decoder Losses
             enc_dec_nll = self.nll_loss(dec_outs, labels)
-            pi_kl = self.cat_kl_loss(log_qy.detach(), log_py, batch_size, unit_average=True)
-            pi_nll = F.cross_entropy(py_logits.view(-1, self.config.k), y_id.view(-1))
-            _, max_pi = torch.max(py_logits.view(-1, self.config.k), dim=1)
-            pi_err = torch.mean((max_pi != y_id.view(-1)).float())
 
             if self.config.use_attribute:
                 pad_embeded = self.x_embedding.weight[self.rev_vocab[PAD]].view(1, 1, self.config.embed_size)
@@ -1006,14 +1007,15 @@ class VAE(LAED):
                 attribute_nll = None
                 adv_err = None
 
-            results = Pack(nll=enc_dec_nll, pi_kl=pi_kl, attribute_nll=attribute_nll,
-                           vae_nll=vae_nll, reg_kl=reg_kl, mi=mi, pi_nll=pi_nll,
-                           pi_err=pi_err, adv_err=adv_err)
+            results = Pack(nll=enc_dec_nll,
+                           attribute_nll=attribute_nll,
+                           vae_nll=vae_nll,
+                           reg_kl=reg_kl,
+                           adv_err=adv_err)
 
             if return_latent:
                 results['log_py'] = log_py
                 results['log_qy'] = log_qy
                 results['dec_init_state'] = dec_init_state
-                results['y_ids'] = y_id
 
             return results
