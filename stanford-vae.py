@@ -131,7 +131,7 @@ def main(config):
                          test_feed,
                          config,
                          evaluator,
-                         gen=dialog_utils.generate_with_adv)
+                         gen=dialog_utils.generate_vae)
         except KeyboardInterrupt:
             print("Training stopped by keyboard.")
 

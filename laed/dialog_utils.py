@@ -1,16 +1,18 @@
 from __future__ import print_function
 
+import pickle
+import logging
+
+import numpy as np
+from torch.autograd import Variable
+import torch.nn.functional as F
+import torch
+
 from laed import main as engine
 from laed.enc2dec.decoders import GEN, DecoderRNN, TEACH_FORCE
 from laed import utils
 from laed.dataset.corpora import PAD, EOS, EOT, USR, SYS
-import logging
-from torch.autograd import Variable
-import torch.nn.functional as F
-import numpy as np
-import pickle
-from laed.main import LossManager
-import torch
+
 
 
 logger = logging.getLogger()
@@ -281,6 +283,71 @@ def gen_with_cond(model, data_feed, config, num_batch=1, dest_f=None):
     logger.info("Generation Done\n")
 
 
+def gen_with_vae(model, data_feed, config, num_batch=1, dest_f=None):
+    model.eval()
+    old_batch_size = config.batch_size
+    if num_batch != None:
+        config.batch_size = 3
+
+    de_tknize = utils.get_dekenize()
+    data_feed.epoch_init(config, shuffle=False, verbose=False)
+
+    logger.info("Generation: {} batches".format(data_feed.num_batch
+                                                if num_batch is None
+                                                else num_batch))
+    print_cnt = 0
+    sample_n = 5
+
+    def write(msg):
+        if dest_f is None:
+            logger.info(msg)
+        else:
+            dest_f.write(msg+'\n')
+
+    while True:
+        batch = data_feed.next_batch()
+        if batch is None or (num_batch is not None
+                             and data_feed.ptr > num_batch):
+            break
+
+        ctx = batch.get('contexts')
+        ctx_size = ctx.shape[1]
+        sample_outputs, _ = model(batch, mode=GEN, gen_type="sample", sample_n=sample_n)
+        greedy_outputs, labels = model(batch, mode=GEN, gen_type="greedy", sample_n=sample_n)
+
+        # move from GPU to CPU
+        labels = labels.cpu()
+        sample_labels = [t.cpu().data.numpy() for t in sample_outputs[DecoderRNN.KEY_SEQUENCE]]
+        greedy_labels = [t.cpu().data.numpy() for t in greedy_outputs[DecoderRNN.KEY_SEQUENCE]]
+
+        sample_labels = np.array(sample_labels, dtype=int).squeeze(-1).swapaxes(0,1)
+        greedy_labels = np.array(greedy_labels, dtype=int).squeeze(-1).swapaxes(0,1)
+        true_labels = labels.data.numpy()
+
+        for b_id in range(true_labels.shape[0]):
+            ctx_str = []
+            for i in range(ctx_size):
+                temp, _ = engine.get_sent(model, de_tknize, ctx[:, i, :], b_id)
+                if temp:
+                    ctx_str.append(temp)
+            ctx_str = '<t>'.join(ctx_str)
+
+            true_str, _ = engine.get_sent(model, de_tknize, true_labels, b_id)
+            print_cnt += 1
+            write("Source: {}".format(ctx_str))
+            write("Target: {}".format(true_str))
+            for n_id in range(sample_n):
+                pred_str, attn = engine.get_sent(model, de_tknize, greedy_labels, b_id+config.batch_size*n_id)
+                write("Sample Z: {}".format(pred_str))
+            for n_id in range(sample_n):
+                pred_str, attn = engine.get_sent(model, de_tknize, sample_labels, b_id+config.batch_size*n_id)
+                write("Sample W: {}".format(pred_str))
+            write('\n')
+    config.batch_size = old_batch_size
+
+    logger.info("Generation Done\n")
+
+
 def selective_generate(model, data_feed, config, selected_clusters):
     model.eval()
     de_tknize = utils.get_dekenize()
@@ -328,4 +395,16 @@ def selective_generate(model, data_feed, config, selected_clusters):
     return data
 
 
+def generate_vae(model, data_feed, config, evaluator, num_batch=1, dest_f=None):
+    eos_id = model.rev_vocab[EOS]
+    model.eval()
+
+    logger.info("Generation with VAE: {} batches".format(data_feed.num_batch
+                                                         if num_batch is None
+                                                         else num_batch))
+
+    if num_batch is not None:
+        gen_with_cond(model, data_feed, config, num_batch)
+
+    logger.info("Generation Done")
 
