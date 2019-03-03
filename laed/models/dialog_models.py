@@ -1013,8 +1013,6 @@ class VAE(LAED):
 
             if return_latent:
                 results['sample_y'] = sample_y
-                results['log_py'] = log_py
-                results['log_qy'] = log_qy
                 results['dec_init_state'] = dec_init_state
 
             return results
