@@ -17,7 +17,7 @@ class SMDDataLoader(DataLoader):
             all_ctx_lens = [len(d.context) for d in self.data]
             self.indexes = list(np.argsort(all_ctx_lens))[::-1]
         else:
-            self.indexes = range(len(self.data))
+            self.indexes = list(range(len(self.data)))
 
     def flatten_dialog(self, data, backward_size):
         results = []
@@ -84,7 +84,7 @@ class SMDDialogSkipLoader(DataLoader):
             all_ctx_lens = [len(d.context) for d in self.data]
             self.indexes = list(np.argsort(all_ctx_lens))[::-1]
         else:
-            self.indexes = range(len(self.data))
+            self.indexes = list(range(len(self.data)))
 
     def flatten_dialog(self, data, backward_size):
         results = []
@@ -273,7 +273,7 @@ class PTBDataLoader(DataLoader):
         if config.fix_batch:
             self.indexes = list(np.argsort(all_lens))
         else:
-            self.indexes = range(len(self.data))
+            self.indexes = list(range(len(self.data)))
 
     def pad_data(self, data):
         for l in data:
