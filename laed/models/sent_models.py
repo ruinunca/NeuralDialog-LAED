@@ -440,5 +440,3 @@ class DiVST(BaseModel):
                 results['y_ids'] = y_ids
 
             return results
-
-

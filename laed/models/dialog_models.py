@@ -16,6 +16,9 @@ from laed.utils import Pack
 import itertools
 import numpy as np
 
+from light_ae_ed import LightAeED
+from light_st_ed import LightStED
+
 
 class LAED(BaseModel):
     def qzx_forward(self, out_utts):
