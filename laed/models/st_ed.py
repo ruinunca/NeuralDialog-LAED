@@ -1,9 +1,27 @@
+# -*- coding: utf-8 -*-
+# author: Tiancheng Zhao
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from laed.dataset.corpora import PAD, BOS, EOS
+from torch.autograd import Variable
+from laed import criterions
+from laed.enc2dec.decoders import DecoderRNN
+from laed.enc2dec.encoders import EncoderRNN, RnnUttEncoder
+from laed.utils import INT, FLOAT, LONG, cast_type
+from laed import nn_lib
+from laed.models.model_bases import BaseModel
+from laed.enc2dec.decoders import GEN, TEACH_FORCE
+from laed.utils import Pack
+import itertools
+import numpy as np
+
 from .laed import LAED
 
 
-class LightStED(LAED):
+class StED(LAED):
     def __init__(self, corpus, config):
-        super(LightStED, self).__init__(config)
+        super(StED, self).__init__(config)
         self.vocab = corpus.vocab
         self.rev_vocab = corpus.rev_vocab
         self.vocab_size = len(self.vocab)
@@ -26,6 +44,27 @@ class LightStED(LAED):
         self.x_init_connector = nn_lib.LinearConnector(config.y_size * config.k,
                                                        config.dec_cell_size,
                                                        config.rnn_cell == 'lstm')
+        # decoder
+        self.prev_decoder = DecoderRNN(self.vocab_size, config.max_dec_len,
+                                        config.embed_size, config.dec_cell_size,
+                                        self.go_id, self.eos_id,
+                                        n_layers=1, rnn_cell=config.rnn_cell,
+                                        input_dropout_p=config.dropout,
+                                        dropout_p=config.dropout,
+                                        use_attention=False,
+                                        use_gpu=config.use_gpu,
+                                        embedding=self.x_embedding)
+
+        self.next_decoder = DecoderRNN(self.vocab_size, config.max_dec_len,
+                                        config.embed_size, config.dec_cell_size,
+                                        self.go_id, self.eos_id,
+                                        n_layers=1, rnn_cell=config.rnn_cell,
+                                        input_dropout_p=config.dropout,
+                                        dropout_p=config.dropout,
+                                        use_attention=False,
+                                        use_gpu=config.use_gpu,
+                                        embedding=self.x_embedding)
+
 
         # Encoder-Decoder STARTS here
         self.embedding = nn.Embedding(self.vocab_size, config.embed_size,
@@ -43,7 +82,6 @@ class LightStED(LAED):
                                       config.num_layer,
                                       config.rnn_cell,
                                       variable_lengths=config.fix_batch)
-        self.x_decoder = nn_lib.LinearConnector(config.dec_cell_size, self.vocab_size)
         # FNN to get Y
         self.p_fc1 = nn.Linear(config.ctx_cell_size, config.ctx_cell_size)
         self.p_y = nn.Linear(config.ctx_cell_size, config.y_size * config.k)
@@ -52,15 +90,26 @@ class LightStED(LAED):
         self.c_init_connector = nn_lib.LinearConnector(config.y_size * config.k,
                                                        config.dec_cell_size,
                                                        config.rnn_cell == 'lstm')
-        self.decoder = nn_lib.LinearConnector(config.dec_cell_size, self.vocab_size)
         # decoder
+        self.decoder = DecoderRNN(self.vocab_size, config.max_dec_len,
+                                  config.embed_size, config.dec_cell_size,
+                                  self.go_id, self.eos_id,
+                                  n_layers=1, rnn_cell=config.rnn_cell,
+                                  input_dropout_p=config.dropout,
+                                  dropout_p=config.dropout,
+                                  use_attention=config.use_attn,
+                                  attn_size=config.dec_cell_size,
+                                  attn_mode=config.attn_type,
+                                  use_gpu=config.use_gpu,
+                                  embedding=self.embedding)
+
         # force G(z,c) has z
         if config.use_attribute:
             self.attribute_loss = criterions.NLLEntropy(-100, config)
 
         self.cat_connector = nn_lib.GumbelConnector()
         self.greedy_cat_connector = nn_lib.GreedyConnector()
-        self.main_loss = torch.nn.BCEWithLogitsLoss()
+        self.nll_loss = criterions.NLLEntropy(self.rev_vocab[PAD], self.config)
         self.cat_kl_loss = criterions.CatKLLoss()
         self.log_uniform_y = Variable(torch.log(torch.ones(1) / config.k))
         self.entropy_loss = criterions.Entropy()
@@ -72,15 +121,15 @@ class LightStED(LAED):
     def valid_loss(self, loss, batch_cnt=None):
         # for the VAE, there is vae_nll, reg_kl
         # for enc-deco, there is nll, pq_kl, maybe xz_nll
-        vst_loss = loss.vst_prev_main + loss.vst_next_main
+        vst_loss = loss.vst_prev_nll + loss.vst_next_nll
 
         if self.config.use_reg_kl:
             vst_loss += loss.reg_kl
 
         if self.config.greedy_q:
-            enc_loss = loss.main + loss.pi_main
+            enc_loss = loss.nll + loss.pi_nll
         else:
-            enc_loss = loss.main + loss.pi_kl
+            enc_loss = loss.nll + loss.pi_kl
 
         if self.config.use_attribute:
             enc_loss += loss.attribute_nll
@@ -142,12 +191,8 @@ class LightStED(LAED):
         next_utts = self.np2var(data_feed['nexts'], LONG)
 
 
-        vst_resp = self.pxz_forward(batch_size,
-                                    self.qzx_forward(out_utts[:,1:]),
-                                    prev_utts,
-                                    next_utts,
-                                    mode,
-                                    gen_type)
+        vst_resp = self.pxz_forward(batch_size, self.qzx_forward(out_utts[:,1:]),
+                                    prev_utts, next_utts, mode, gen_type)
 
         # context encoder
         c_inputs = self.utt_encoder(ctx_utts)
@@ -209,8 +254,10 @@ class LightStED(LAED):
         dec_init_state = self.c_init_connector(sample_y) + c_last.unsqueeze(0)
 
         # decode
-        outputs = self.decoder(dec_init_state)
-
+        dec_outs, dec_last, dec_ctx = self.decoder(batch_size, out_utts[:, 0:-1], dec_init_state,
+                                                   attn_context=attn_inputs,
+                                                   mode=mode, gen_type=gen_type,
+                                                   beam_size=self.config.beam_size)
         # get decoder inputs
         labels = out_utts[:, 1:].contiguous()
         prev_labels = prev_utts[:, 1:].contiguous()
@@ -236,8 +283,10 @@ class LightStED(LAED):
 
             # Encoder-decoder Losses
             enc_dec_nll = self.nll_loss(dec_outs, labels)
-            pi_kl = self.cat_kl_loss(log_qy.detach(), log_py, batch_size, unit_average=True)
-            pi_nll = F.cross_entropy(py_logits.view(-1, self.config.k), y_id.view(-1))
+            pi_kl = self.cat_kl_loss(log_qy.detach(), log_py, batch_size,
+                                     unit_average=True)
+            pi_nll = F.cross_entropy(py_logits.view(-1, self.config.k),
+                                     y_id.view(-1))
             _, max_pi = torch.max(py_logits.view(-1, self.config.k), dim=1)
             pi_err = torch.mean((max_pi != y_id.view(-1)).float())
 
@@ -266,16 +315,10 @@ class LightStED(LAED):
                 attribute_nll = None
                 adv_err = None
 
-            results = Pack(nll=enc_dec_nll,
-                           pi_kl=pi_kl,
-                           pi_nll=pi_nll,
+            results = Pack(nll=enc_dec_nll, pi_kl=pi_kl, pi_nll=pi_nll,
                            attribute_nll=attribute_nll,
-                           vst_prev_nll=vst_prev_nll,
-                           vst_next_nll=vst_next_nll,
-                           reg_kl=reg_kl,
-                           mi=mi,
-                           pi_err=pi_err,
-                           adv_err=adv_err)
+                           vst_prev_nll=vst_prev_nll, vst_next_nll=vst_next_nll,
+                           reg_kl=reg_kl, mi=mi, pi_err=pi_err, adv_err=adv_err)
 
             if return_latent:
                 results['log_py'] = log_py
@@ -284,3 +327,4 @@ class LightStED(LAED):
                 results['y_ids'] = y_id
 
             return results
+

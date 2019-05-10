@@ -16,6 +16,8 @@ from laed.enc2dec.decoders import GEN
 from laed.utils import Pack
 import itertools
 
+from .light_di_vae import LightDiVAE
+
 
 class DiVAE(BaseModel):
     def __init__(self, corpus, config):

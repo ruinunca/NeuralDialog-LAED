@@ -1,4 +1,4 @@
-from .model_bases import LAED
+from .laed import LAED
 
 
 class LightAeED(LAED):

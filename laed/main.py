@@ -128,9 +128,6 @@ def train(model, train_feed, valid_feed, test_feed, config, evaluator, gen=None)
                 # validation
                 valid_loss = validate(model,valid_feed, config, batch_cnt)
 
-                # generating
-                gen(model, test_feed, config, evaluator, num_batch=config.preview_batch_num)
-
                 # update early stopping stats
                 if valid_loss < best_valid_loss:
                     if valid_loss <= valid_loss_threshold * config.improve_threshold:
