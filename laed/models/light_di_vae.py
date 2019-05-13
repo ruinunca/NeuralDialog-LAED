@@ -59,7 +59,7 @@ class LightDiVAE(BaseModel):
                                                          self.rnn_cell == 'lstm',
                                                          has_bias=False)
 
-        self.decoder = nn_lib.LinearConnector(config.dec_cell_size, self.vocab_size, is_lstm=False)
+        self.decoder = nn_lib.LinearConnector(config.dec_cell_size, self.vocab_size, False)
         self.main_loss = torch.nn.BCEWithLogitsLoss()
         self.cat_kl_loss = criterions.CatKLLoss()
         self.cross_ent_loss = criterions.CrossEntropyoss()
@@ -83,6 +83,9 @@ class LightDiVAE(BaseModel):
 
     def forward(self, data_feed, mode, gen_type='greedy', sample_n=1, return_latent=False):
         batch_size = data_feed['outputs'].shape[0]
+        out_utts_bow = data_feed.get('outputs_bow')
+        if out_utts_bow:
+            out_utts_bow = self.np2var(outputs_bow, FLOAT) 
         out_utts = self.np2var(data_feed['outputs'], LONG)
 
         # output encoder
@@ -111,10 +114,6 @@ class LightDiVAE(BaseModel):
         # map sample to initial state of decoder
         dec_init_state = self.dec_init_connector(sample_y)
 
-        # get decoder inputs
-        labels = out_utts[:, 1:].contiguous()
-        dec_inputs = out_utts[:, 0:-1]
-
         # decode
         dec_outs = self.decoder(dec_init_state)
 
@@ -123,7 +122,8 @@ class LightDiVAE(BaseModel):
             return dec_ctx, labels
         else:
             # BOW reconstruction
-            main = self.main_loss(dec_outs, labels)
+            main = self.main_loss(dec_outs.squeeze(0).squeeze(0), out_utts_bow) if out_utts_bow \
+                else 0.0
 
             # regularization qy to be uniform
             avg_log_qy = torch.exp(log_qy.view(-1, self.config.y_size, self.config.k))
