@@ -145,6 +145,10 @@ def generate_with_adv(model, data_feed, config, evaluator, num_batch=1, dest_f=N
             norm_out_utts.append((1.0-seq_terminate)*t)
 
         norm_out_utts = torch.cat(norm_out_utts, dim=1)
+
+        # FIX
+        norm_out_utts = norm_out_utts.cuda().long()
+
         qzx_results = model.qzx_forward(norm_out_utts)
         log_qy = F.log_softmax(qzx_results.qy_logits, dim=1)
 
