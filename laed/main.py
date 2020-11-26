@@ -158,7 +158,7 @@ def train(model, train_feed, valid_feed, test_feed, config, evaluator, gen=None)
                 # exit eval model
                 model.train()
                 train_loss.clear()
-                logger.info("\n**** Epcoch {}/{} ****".format(done_epoch,
+                logger.info("\n**** Epoch {}/{} ****".format(done_epoch,
                                                        config.max_epoch))
 
 
